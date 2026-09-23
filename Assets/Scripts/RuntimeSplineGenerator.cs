@@ -1,7 +1,6 @@
 using UnityEngine;
 using UnityEngine.Splines;
 using Unity.Mathematics;
-using System.Collections.Generic;
 using System.Linq;
 
 namespace Unity.Splines
@@ -13,6 +12,8 @@ namespace Unity.Splines
         [SerializeField] private float m_KnotSpacing = 1.0f;
         [SerializeField] private float m_LerpSpeed = 10.0f;
         [SerializeField] private LayerMask m_GroundLayer = -1;
+        [SerializeField] private bool m_AutoConnectOnCollision = true;
+        [SerializeField] private float m_MinLengthBeforeAutoConnect = 1.0f;
 
         private Spline m_CurrentSpline;
         private int m_CurrentSplineIndex = -1;
@@ -25,7 +26,7 @@ namespace Unity.Splines
             {
                 m_SplineContainer = GetComponent<SplineContainer>();
             }
-            
+
             if (m_SplineTrack == null)
             {
                 m_SplineTrack = GetComponent<SplineTrack>();
@@ -45,7 +46,7 @@ namespace Unity.Splines
 
             if (Input.GetMouseButtonUp(0))
             {
-                 FinishCurrentSpline();
+                FinishCurrentSpline();
             }
 
             if (Input.GetMouseButtonDown(1))
@@ -62,6 +63,13 @@ namespace Unity.Splines
                 Vector3 worldPos = hit.point;
                 float3 localPos = m_SplineContainer.transform.InverseTransformPoint(worldPos);
                 localPos.y = -2f;
+
+                if (m_SplineTrack != null &&
+                    m_SplineTrack.TrySnapToNearestEndpoint(localPos, -1, out float3 snappedStart))
+                {
+                    localPos = snappedStart;
+                    localPos.y = -2f;
+                }
 
                 m_LastLerpedPosition = localPos;
                 m_IsDragging = true;
@@ -83,9 +91,8 @@ namespace Unity.Splines
             {
                 Vector3 worldPos = hit.point;
                 float3 targetLocalPos = m_SplineContainer.transform.InverseTransformPoint(worldPos);
-                targetLocalPos.y = -2.01f;
+                targetLocalPos.y = -2f;
 
-                // Lerp the position
                 m_LastLerpedPosition = math.lerp(m_LastLerpedPosition, targetLocalPos, Time.deltaTime * m_LerpSpeed);
 
                 if (AddKnotToSpline(m_LastLerpedPosition))
@@ -93,6 +100,15 @@ namespace Unity.Splines
                     if (m_SplineTrack != null)
                     {
                         m_SplineTrack.RebuildMesh();
+                    }
+
+                    // Auto-finish when the stroke tip collides with an existing road
+                    if (m_AutoConnectOnCollision &&
+                        m_SplineTrack != null &&
+                        m_CurrentSpline.GetLength() >= m_MinLengthBeforeAutoConnect &&
+                        m_SplineTrack.WouldCollideWithExistingRoad(m_CurrentSplineIndex))
+                    {
+                        FinishCurrentSpline();
                     }
                 }
             }
@@ -102,8 +118,7 @@ namespace Unity.Splines
         {
             m_CurrentSpline = m_SplineContainer.AddSpline();
             m_CurrentSplineIndex = m_SplineContainer.Splines.Count - 1;
-            
-            // Add initial knot
+
             m_CurrentSpline.Add(new BezierKnot(position), TangentMode.AutoSmooth);
         }
 
@@ -111,7 +126,6 @@ namespace Unity.Splines
         {
             if (m_CurrentSpline == null) return false;
 
-            // Optional: Check distance from last knot to avoid redundant points
             var lastKnot = m_CurrentSpline.Knots.ElementAt(m_CurrentSpline.Count - 1);
             if (math.distance(lastKnot.Position, position) < m_KnotSpacing)
             {
@@ -124,15 +138,22 @@ namespace Unity.Splines
 
         private void FinishCurrentSpline()
         {
-            if (m_SplineTrack != null)
+            if (!m_IsDragging && m_CurrentSpline == null)
+                return;
+
+            if (m_CurrentSpline != null && m_CurrentSpline.Count >= 2 && m_SplineTrack != null)
             {
+                m_SplineTrack.ConnectSplineToExistingRoads(m_CurrentSplineIndex);
                 m_SplineTrack.AutoDetectJunctions();
             }
-            
+            else if (m_CurrentSpline != null && m_SplineTrack != null)
+            {
+                m_SplineTrack.RebuildMesh();
+            }
+
             m_CurrentSpline = null;
             m_CurrentSplineIndex = -1;
             m_IsDragging = false;
-            Debug.Log("Finished current spline.");
         }
 
         [ContextMenu("Clear All Splines")]
@@ -145,15 +166,16 @@ namespace Unity.Splines
                     m_SplineContainer.RemoveSplineAt(0);
                 }
             }
-            
+
             if (m_SplineTrack != null)
             {
                 m_SplineTrack.ClearJunctions();
                 m_SplineTrack.RebuildMesh();
             }
-            
+
             m_CurrentSpline = null;
             m_CurrentSplineIndex = -1;
+            m_IsDragging = false;
         }
     }
 }

@@ -114,7 +114,10 @@ public class SplineOverlay : Overlay
             SplineContainer container = (SplineContainer)item.target;
             Spline spline = container.Splines[item.targetIndex];
             BezierKnot knot = spline.Knots.ElementAt(item.knotIndex);
-            builder.AddJunction(item.targetIndex, item.knotIndex, spline, knot);
+            
+            // Calculate t for the knot
+            float t = (float)item.knotIndex / (spline.Count - 1);
+            builder.AddJunction(item.targetIndex, item.knotIndex, t, spline, knot);
 
             // Store world position for overlay
             Vector3 worldPos = container.transform.TransformPoint(knot.Position);

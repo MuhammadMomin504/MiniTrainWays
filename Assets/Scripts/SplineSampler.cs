@@ -66,10 +66,11 @@ public class SplineSampler : MonoBehaviour
         splineContainer.Evaluate(index, t, out float3 pos, out float3 tan, out float3 up);
 
         // Calculate the right vector (perpendicular to tangent and up)
-        float3 right = math.cross(tan, up);
+        float3 right = Vector3.Cross(tan, up).normalized;
+        // float3 right = math.cross(tan, up);
     
         // Normalize to ensure consistent width regardless of scale
-        right = math.normalize(right);
+        //right = math.normalize(right);
 
         // Calculate edges
         leftEdge = pos + (right * (width));

@@ -9,13 +9,15 @@ using UnityEngine.Splines;
         {
             public int splineIndex;
             public int knotIndex;
+            public float t;
             public Spline spline;
             public BezierKnot knot;
 
-            public JunctionInfo(int splineIndex, int knotIndex, Spline spline, BezierKnot knot)
+            public JunctionInfo(int splineIndex, int knotIndex, float t, Spline spline, BezierKnot knot)
             {
                 this.splineIndex = splineIndex;
                 this.knotIndex = knotIndex;
+                this.t = t;
                 this.spline = spline;
                 this.knot = knot;
             }
@@ -24,11 +26,11 @@ using UnityEngine.Splines;
         
         public List<JunctionInfo> junctions;
 
-        public void AddJunction(int splineIndex, int knotIndex, Spline spline, BezierKnot knot)
+        public void AddJunction(int splineIndex, int knotIndex, float t, Spline spline, BezierKnot knot)
         {
             if (junctions == null)
                 junctions = new List<JunctionInfo>();
-            junctions.Add(new JunctionInfo(splineIndex, knotIndex, spline, knot));
+            junctions.Add(new JunctionInfo(splineIndex, knotIndex, t, spline, knot));
         }
 
         internal IEnumerable<JunctionInfo> GetJunctions()
