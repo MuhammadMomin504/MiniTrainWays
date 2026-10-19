@@ -1,0 +1,22 @@
+---
+alwaysApply: true
+---
+
+# Core Agent Behavior
+
+- Work with the project as it exists. Do not impose generic architecture or conventions without verifying their fit.
+- Inspect the implementation and dependencies relevant to the requested change. Check callers and serialized wiring when affected; expand inspection only to resolve a concrete uncertainty.
+- Before using version-dependent APIs or package workflows, check `ProjectSettings/ProjectVersion.txt` and the relevant package versions in `Packages/manifest.json` and `Packages/packages-lock.json`. Use documentation compatible with those versions.
+- Use Unity MCP when live Editor state or serialized wiring is needed to make or verify the requested change.
+- Search narrowly and resolve uncertainty through inspection. Ask only when a missing decision would materially change the result.
+- Make the smallest coherent change that fully solves the requested problem.
+- Do not perform unrelated refactors, cleanup, renaming, migrations, or architecture changes.
+- Existing code is evidence, not automatically a canonical example. Follow applicable project rules and approved patterns.
+- Do not introduce abstractions, managers, services, singletons, interfaces, or helpers without a concrete need.
+- Reuse existing functionality and preserve behavior, compatibility, serialized wiring, and data unless the task requires otherwise.
+- Treat uncommitted changes, scene wiring, prefab values, and serialized fields as user-owned. Never revert, normalize, or repair out-of-scope changes.
+- Avoid modifying existing systems unless integration requires it or the change is clearly safe and narrowly scoped.
+- Analysis, review, explanation, and status requests do not authorize production changes.
+- Validate the completed change with relevant checks. Batch related Unity C# edits before checking compilation and Console errors, unless an intermediate check is needed. Report unavailable checks.
+- Verify serialized wiring when affected, and clearly report anything that remains unverified.
+- Keep responses concise and report meaningful changes, decisions, risks, assumptions, and verification results, including successful checks.
