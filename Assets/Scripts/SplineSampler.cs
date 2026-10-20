@@ -56,25 +56,49 @@ public class SplineSampler : MonoBehaviour
     
     public void GetSplineWidthEdges(int index, float t, float width, out float3 leftEdge, out float3 rightEdge)
     {
+        TryGetSplineWidthEdges(index, t, width, out _, out _, out leftEdge, out rightEdge);
+    }
+
+    /// <summary>
+    /// Constant-width road frame. Uses world-up so a join cannot flip the ribbon
+    /// when spline up/tangent become unstable.
+    /// </summary>
+    public bool TryGetSplineWidthEdges(
+        int index,
+        float t,
+        float width,
+        out float3 position,
+        out float3 tangent,
+        out float3 leftEdge,
+        out float3 rightEdge)
+    {
+        position = tangent = leftEdge = rightEdge = float3.zero;
         if (splineContainer == null || index < 0 || index >= splineContainer.Splines.Count)
+            return false;
+
+        t = math.saturate(t);
+        splineContainer.Evaluate(index, t, out position, out float3 tan, out _);
+
+        if (math.lengthsq(tan) < 1e-8f)
         {
-            leftEdge = rightEdge = float3.zero;
-            return;
+            float t2 = math.saturate(t < 0.5f ? t + 0.02f : t - 0.02f);
+            splineContainer.Evaluate(index, t2, out float3 pos2, out _, out _);
+            tan = t2 >= t ? pos2 - position : position - pos2;
         }
 
-        // Evaluate position, tangent, and up vector at time t
-        splineContainer.Evaluate(index, t, out float3 pos, out float3 tan, out float3 up);
+        tangent = math.normalizesafe(tan);
+        if (math.lengthsq(tangent) < 1e-8f)
+            return false;
 
-        // Calculate the right vector (perpendicular to tangent and up)
-        float3 right = Vector3.Cross(tan, up).normalized;
-        // float3 right = math.cross(tan, up);
-    
-        // Normalize to ensure consistent width regardless of scale
-        //right = math.normalize(right);
+        float3 worldUp = new float3(0f, 1f, 0f);
+        float3 right = math.cross(tangent, worldUp);
+        if (math.lengthsq(right) < 1e-8f)
+            right = math.cross(tangent, new float3(0f, 0f, 1f));
+        right = math.normalizesafe(right);
 
-        // Calculate edges
-        leftEdge = pos + (right * (width));
-        rightEdge = pos + (-right * (width));
+        leftEdge = position + right * width;
+        rightEdge = position - right * width;
+        return true;
     }
 
     private void OnDrawGizmos()
