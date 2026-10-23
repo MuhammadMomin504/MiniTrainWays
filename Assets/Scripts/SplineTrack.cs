@@ -17,7 +17,10 @@ namespace Unity.Splines
         [SerializeField] private float m_TextureScale = 1.0f;
         [SerializeField] private Material m_JunctionMaterial;
         [SerializeField] private float m_JunctionSnapDistance = 0.5f;
+        [Tooltip("Extra road length (in road widths) given to the curved blend between roads at a junction.")]
         [SerializeField] private float m_JunctionInsetScale = 1f;
+        [Tooltip("Lerp subdivisions used for each curved edge between two junction arms.")]
+        [SerializeField] [Min(1)] private int m_JunctionCurveSegments = 8;
         [Tooltip("Max centerline distance to treat a drawn tip as colliding with an existing road.")]
         [SerializeField] private float m_ConnectDistance = -1f;
 
@@ -33,29 +36,25 @@ namespace Unity.Splines
         private List<Color> m_Colors = new List<Color>();
 
         private readonly Dictionary<int, float2> m_SplineTrimRanges = new Dictionary<int, float2>();
-        private readonly Dictionary<int, EndCapOverride> m_EndCapOverrides = new Dictionary<int, EndCapOverride>();
-
-        private struct EndCapOverride
-        {
-            public bool hasStart;
-            public bool hasEnd;
-            public Vector3 startLeft;
-            public Vector3 startRight;
-            public Vector3 endLeft;
-            public Vector3 endRight;
-        }
+        private readonly List<JunctionPad> m_JunctionPads = new List<JunctionPad>();
 
         private struct JunctionArm
         {
             public int splineIndex;
-            public float t;
-            public float3 pos;
-            public float3 outward;
-            public float3 leftPt;
-            public float3 rightPt;
-            public float3 leftMiter;
-            public float3 rightMiter;
-            public bool isThrough;
+            public float t;            // spline end touching the junction (0 or 1)
+            public float3 pos;         // centerline point at the junction
+            public float3 outward;     // direction leaving the junction
+            public float angle;
+            public float capT;         // where the road strip stops and the pad takes over
+            public float3 capOutward;
+            public float3 capLeft;     // left/right relative to outward, not spline direction
+            public float3 capRight;
+        }
+
+        private struct JunctionPad
+        {
+            public Vector3 center;
+            public List<Vector3> boundary;
         }
 
         public float JunctionSnapDistance => m_JunctionSnapDistance;
@@ -63,6 +62,12 @@ namespace Unity.Splines
 
         public float ConnectDistance =>
             m_ConnectDistance > 0f ? m_ConnectDistance : math.max(m_JunctionSnapDistance, m_Width * 1.5f);
+
+        /// <summary>
+        /// A new connection closer than one road width to an existing junction joins it instead of
+        /// forming its own; farther away it gets a separate junction so the new road is not bent.
+        /// </summary>
+        public float JunctionMergeDistance => math.min(m_JunctionSnapDistance, m_Width * 2f);
 
         private void Awake()
         {
@@ -82,15 +87,17 @@ namespace Unity.Splines
         }
 
         /// <summary>
-        /// Finds the nearest start/end knot among existing splines (optionally excluding one).
+        /// Finds the nearest start/end knot among existing splines (optionally excluding one),
+        /// within maxDistance or the junction snap distance when none is given.
         /// </summary>
-        public bool TrySnapToNearestEndpoint(float3 localPosition, int excludeSplineIndex, out float3 snappedLocal)
+        public bool TrySnapToNearestEndpoint(float3 localPosition, int excludeSplineIndex, out float3 snappedLocal,
+            float maxDistance = -1f)
         {
             snappedLocal = localPosition;
             if (splineContainer == null || splineContainer.Splines == null)
                 return false;
 
-            float bestDist = m_JunctionSnapDistance;
+            float bestDist = maxDistance > 0f ? maxDistance : m_JunctionSnapDistance;
             bool found = false;
             float3 best = localPosition;
 
@@ -128,16 +135,17 @@ namespace Unity.Splines
         }
 
         /// <summary>
-        /// True when the connecting spline's drawing tip is within ConnectDistance of another road centerline.
+        /// True when the connecting spline's drawing tip is running into another road.
         /// </summary>
         public bool WouldCollideWithExistingRoad(int connectingIndex)
         {
-            return TryFindRoadCollision(connectingIndex, tipOnly: true, out _, out _, out _, out _, out _);
+            return TryFindRoadHit(connectingIndex, atStart: false, out _, out _, out _);
         }
 
         /// <summary>
         /// Snaps a drawn spline into the network: endpoint merge, or mid-road T-junction
-        /// (insert knot, split hit road, snap tip, link knots).
+        /// (insert knot, split hit road, snap tip, link knots). Each end connects on its own,
+        /// so a stroke can leave one road and join another.
         /// </summary>
         public bool ConnectSplineToExistingRoads(int connectingIndex)
         {
@@ -151,34 +159,46 @@ namespace Unity.Splines
             // Freeze AutoSmooth tangents so snapping / splitting cannot reshape existing roads.
             BakeAllSplineTangents();
 
-            // Prefer exact endpoint snaps first (tip, then start)
-            bool connected = false;
-            float3 startPos = connecting[0].Position;
-            float3 endPos = connecting[connecting.Count - 1].Position;
+            // Tip first: a mid-road split renumbers splines, so each end looks its index up again.
+            bool connected = ConnectSplineEnd(connecting, atStart: false);
+            connected |= ConnectSplineEnd(connecting, atStart: true);
+            return connected;
+        }
 
-            if (TrySnapToNearestEndpoint(endPos, connectingIndex, out float3 snapEnd))
-            {
-                TruncateCollapsedKnotsFromEnd(connecting, snapEnd);
-                SnapTipWithoutDeform(connecting, connecting.Count - 1, snapEnd);
-                connected = true;
-            }
-
-            if (TrySnapToNearestEndpoint(startPos, connectingIndex, out float3 snapStart))
-            {
-                TruncateCollapsedKnotsFromStart(connecting, snapStart);
-                SnapTipWithoutDeform(connecting, 0, snapStart);
-                connected = true;
-            }
-
-            if (connected)
-                return true;
-
-            // Mid-road / body collision from the stroke tip (drawing end)
-            if (!TryFindRoadCollision(connectingIndex, tipOnly: true, out bool tipIsStart, out int hitSplineIndex,
-                    out float hitT, out float3 hitPos, out _))
+        private bool ConnectSplineEnd(Spline connecting, bool atStart)
+        {
+            int connectingIndex = IndexOfSpline(connecting);
+            if (connectingIndex < 0 || connecting.Count < 2)
                 return false;
 
-            return FormJunctionAtHit(connectingIndex, tipIsStart, hitSplineIndex, hitT, hitPos);
+            // Decide from where the stroke actually meets a road. Snapping to any endpoint near the
+            // stroke end first would drag new roads onto a neighbouring junction and bend them.
+            if (TryFindRoadHit(connectingIndex, atStart, out int hitSplineIndex, out float hitT, out float3 hitPos))
+                return FormJunctionAtHit(connectingIndex, atStart, hitSplineIndex, hitT, hitPos);
+
+            // Dead ends the stroke heads at are handled above; here only practically touching ends join.
+            float3 endPos = connecting[atStart ? 0 : connecting.Count - 1].Position;
+            if (TrySnapToNearestEndpoint(endPos, connectingIndex, out float3 snapped, JunctionMergeDistance))
+            {
+                SnapConnectingEnd(connecting, atStart, snapped);
+                return true;
+            }
+
+            return false;
+        }
+
+        private void SnapConnectingEnd(Spline connecting, bool atStart, float3 position)
+        {
+            if (atStart)
+            {
+                TruncateCollapsedKnotsFromStart(connecting, position);
+                SnapTipWithoutDeform(connecting, 0, position);
+            }
+            else
+            {
+                TruncateCollapsedKnotsFromEnd(connecting, position);
+                SnapTipWithoutDeform(connecting, connecting.Count - 1, position);
+            }
         }
 
         private bool FormJunctionAtHit(
@@ -189,26 +209,18 @@ namespace Unity.Splines
             float3 hitPos)
         {
             var connecting = splineContainer.Splines[connectingIndex];
+            var hitSpline = splineContainer.Splines[hitSplineIndex];
 
-            // Near an existing endpoint of the hit road — snap the new tip only.
-            // Never rewrite the existing road's tangents.
-            if (hitT <= 0.05f || hitT >= 0.95f)
+            // Near an existing endpoint (a dead end or another junction) — join it, snapping the new
+            // tip only. Measured in distance: a fraction of t is huge on long roads and tiny on the
+            // short pieces between junctions. Never rewrite the existing road's tangents.
+            float3 firstPoint = hitSpline[0].Position;
+            float3 lastPoint = hitSpline[hitSpline.Count - 1].Position;
+            float dFirst = math.distance(hitPos, firstPoint);
+            float dLast = math.distance(hitPos, lastPoint);
+            if (math.min(dFirst, dLast) <= JunctionMergeDistance)
             {
-                float3 endPoint = hitT <= 0.05f
-                    ? splineContainer.Splines[hitSplineIndex][0].Position
-                    : splineContainer.Splines[hitSplineIndex][splineContainer.Splines[hitSplineIndex].Count - 1].Position;
-
-                if (tipIsStart)
-                {
-                    TruncateCollapsedKnotsFromStart(connecting, endPoint);
-                    SnapTipWithoutDeform(connecting, 0, endPoint);
-                }
-                else
-                {
-                    TruncateCollapsedKnotsFromEnd(connecting, endPoint);
-                    SnapTipWithoutDeform(connecting, connecting.Count - 1, endPoint);
-                }
-
+                SnapConnectingEnd(connecting, tipIsStart, dFirst <= dLast ? firstPoint : lastPoint);
                 return true;
             }
 
@@ -229,16 +241,8 @@ namespace Unity.Splines
             if (connectingIndex < 0)
                 return false;
 
-            if (tipIsStart)
-            {
-                TruncateCollapsedKnotsFromStart(connecting, hitPos);
-                SnapTipWithoutDeform(connecting, 0, hitPos);
-            }
-            else
-            {
-                TruncateCollapsedKnotsFromEnd(connecting, hitPos);
-                SnapTipWithoutDeform(connecting, connecting.Count - 1, hitPos);
-            }
+            // Snap onto the inserted knot itself so every end at this junction coincides exactly.
+            SnapConnectingEnd(connecting, tipIsStart, firstHalf[firstHalf.Count - 1].Position);
 
             int tipKnot = tipIsStart ? 0 : connecting.Count - 1;
             SplineUtility.LinkKnots(splineContainer,
@@ -252,34 +256,37 @@ namespace Unity.Splines
         }
 
         /// <summary>
-        /// Finds the nearest existing road to the stroke tip (and optionally start).
-        /// tipOnly=true is used while drawing so the body of a long stroke cannot false-trigger.
+        /// The road one end of the connecting spline runs into, and where. Auto-connect stops the
+        /// stroke up to ConnectDistance short, so the stroke is extended along its approach direction
+        /// to find the real crossing; the road crossed soonest wins. A road merely running alongside
+        /// within ConnectDistance must not capture the stroke, so without a crossing only a road the
+        /// end already overlaps, or a dead end it runs into, counts.
         /// </summary>
-        private bool TryFindRoadCollision(
+        private bool TryFindRoadHit(
             int connectingIndex,
-            bool tipOnly,
-            out bool tipIsStart,
+            bool atStart,
             out int hitSplineIndex,
             out float hitT,
-            out float3 hitPos,
-            out float connectingT)
+            out float3 hitPos)
         {
-            tipIsStart = false;
             hitSplineIndex = -1;
             hitT = 0f;
             hitPos = float3.zero;
-            connectingT = 1f;
 
             var connecting = splineContainer.Splines[connectingIndex];
             if (connecting == null || connecting.Count < 2)
                 return false;
 
-            float maxDist = ConnectDistance;
-            float bestDist = float.MaxValue;
-            bool found = false;
+            float3 origin = connecting[atStart ? 0 : connecting.Count - 1].Position;
+            float reach = ConnectDistance;
+            bool hasDirection = TryGetApproachDirection(connecting, atStart, out float3 direction);
 
-            // Drawing tip (end knot) — primary collision probe while sketching
-            float3 endSample = connecting[connecting.Count - 1].Position;
+            float bestAlong = float.MaxValue;
+            int fallbackIndex = -1;
+            float fallbackDist = float.MaxValue;
+            float fallbackT = 0f;
+            float3 fallbackPos = float3.zero;
+
             for (int s = 0; s < splineContainer.Splines.Count; s++)
             {
                 if (s == connectingIndex) continue;
@@ -287,42 +294,122 @@ namespace Unity.Splines
                 var other = splineContainer.Splines[s];
                 if (other == null || other.Count < 2) continue;
 
-                float dist = SplineUtility.GetNearestPoint(other, endSample, out float3 nearest, out float tHit);
-                if (dist > maxDist || dist >= bestDist) continue;
+                float dist = SplineUtility.GetNearestPoint(other, origin, out float3 nearest, out float tNear);
+                if (dist > reach) continue;
 
-                bestDist = dist;
-                found = true;
-                tipIsStart = false;
-                hitSplineIndex = s;
-                hitT = tHit;
-                hitPos = nearest;
-                connectingT = 1f;
-            }
-
-            if (!tipOnly)
-            {
-                float3 startSample = connecting[0].Position;
-                for (int s = 0; s < splineContainer.Splines.Count; s++)
+                if (hasDirection &&
+                    TryRaycastSplineXZ(other, origin, direction, reach, reach * 3f,
+                        out float rayT, out float3 rayPos, out float along))
                 {
-                    if (s == connectingIndex) continue;
+                    if (math.abs(along) < bestAlong)
+                    {
+                        bestAlong = math.abs(along);
+                        hitSplineIndex = s;
+                        hitT = rayT;
+                        hitPos = rayPos;
+                    }
+                    continue;
+                }
 
-                    var other = splineContainer.Splines[s];
-                    if (other == null || other.Count < 2) continue;
-
-                    float dist = SplineUtility.GetNearestPoint(other, startSample, out float3 nearest, out float tHit);
-                    if (dist > maxDist || dist >= bestDist) continue;
-
-                    bestDist = dist;
-                    found = true;
-                    tipIsStart = true;
-                    hitSplineIndex = s;
-                    hitT = tHit;
-                    hitPos = nearest;
-                    connectingT = 0f;
+                // Any point beside a road's end has that end as its nearest point, so a dead end only
+                // counts when the stroke is heading at it, or already touching it.
+                bool overlapping = dist <= m_Width * 2f;
+                bool nearestIsEnd = math.distance(nearest, other[0].Position) < 1e-3f ||
+                                    math.distance(nearest, other[other.Count - 1].Position) < 1e-3f;
+                bool headingAtEnd = hasDirection && dist > 1e-4f &&
+                                    math.dot(direction, math.normalizesafe(nearest - origin)) >= 0.5f;
+                bool atDeadEnd = nearestIsEnd && (headingAtEnd || dist <= JunctionMergeDistance);
+                if ((overlapping || atDeadEnd) && dist < fallbackDist)
+                {
+                    fallbackDist = dist;
+                    fallbackIndex = s;
+                    fallbackT = tNear;
+                    fallbackPos = nearest;
                 }
             }
 
-            return found;
+            if (hitSplineIndex < 0 && fallbackIndex >= 0)
+            {
+                hitSplineIndex = fallbackIndex;
+                hitT = fallbackT;
+                hitPos = fallbackPos;
+            }
+
+            return hitSplineIndex >= 0;
+        }
+
+        /// <summary>
+        /// Flat direction the stroke travels as it leaves through this end, averaged over a short
+        /// stretch so knot jitter from the drawing lerp does not skew it.
+        /// </summary>
+        private bool TryGetApproachDirection(Spline connecting, bool atStart, out float3 direction)
+        {
+            direction = float3.zero;
+            float length = connecting.GetLength();
+            if (length < 1e-4f)
+                return false;
+
+            float back = math.clamp(ConnectDistance / length, 0.01f, 0.25f);
+            float3 inner = connecting.EvaluatePosition(atStart ? back : 1f - back);
+            float3 end = connecting[atStart ? 0 : connecting.Count - 1].Position;
+
+            direction = end - inner;
+            direction.y = 0f;
+            direction = math.normalizesafe(direction);
+            return math.lengthsq(direction) > 0.5f;
+        }
+
+        /// <summary>
+        /// Intersects a ray with a spline's centerline on the ground plane. Accepts hits slightly
+        /// behind the origin so an end that overshot the centerline is pulled back onto it.
+        /// </summary>
+        private static bool TryRaycastSplineXZ(
+            Spline spline,
+            float3 origin,
+            float3 direction,
+            float maxBehind,
+            float maxAhead,
+            out float hitT,
+            out float3 hitPos,
+            out float hitAlong)
+        {
+            hitT = 0f;
+            hitPos = float3.zero;
+            hitAlong = 0f;
+
+            int samples = math.clamp((int)(spline.GetLength() / 0.05f), 16, 512);
+            float bestAbs = float.MaxValue;
+            float prevT = 0f;
+            float3 prev = spline.EvaluatePosition(0f);
+
+            for (int i = 1; i <= samples; i++)
+            {
+                float t = i / (float)samples;
+                float3 next = spline.EvaluatePosition(t);
+                float3 seg = next - prev;
+
+                float denom = direction.x * seg.z - direction.z * seg.x;
+                if (math.abs(denom) > 1e-6f)
+                {
+                    float3 diff = prev - origin;
+                    float along = (diff.x * seg.z - diff.z * seg.x) / denom;
+                    float u = (diff.x * direction.z - diff.z * direction.x) / denom;
+
+                    if (u >= 0f && u <= 1f && along >= -maxBehind && along <= maxAhead &&
+                        math.abs(along) < bestAbs)
+                    {
+                        bestAbs = math.abs(along);
+                        hitAlong = along;
+                        hitT = math.lerp(prevT, t, u);
+                        hitPos = math.lerp(prev, next, u);
+                    }
+                }
+
+                prev = next;
+                prevT = t;
+            }
+
+            return bestAbs < float.MaxValue;
         }
 
         private static int InsertKnotAtNormalizedT(Spline spline, float t)
@@ -412,8 +499,8 @@ namespace Unity.Splines
         }
 
         /// <summary>
-        /// Moves only the joining tip. Linear mode keeps the last segment straight and
-        /// leaves every other baked knot untouched.
+        /// Moves only the joining tip of the new road. Linear mode keeps the last segment
+        /// straight; existing roads are never touched.
         /// </summary>
         private static void SnapTipWithoutDeform(Spline spline, int index, float3 position)
         {
@@ -423,6 +510,12 @@ namespace Unity.Splines
             var knot = spline[index];
             knot.Position = position;
             spline.SetKnot(index, knot);
+
+            // Moving the tip leaves a straight cut that can kink against the next kept knot
+            // tighter than the road is wide, folding the strip. Re-smooth that one knot of the
+            // new road so the bend spreads over both of its segments.
+            if (spline.Count > 2)
+                spline.SetTangentMode(index == 0 ? 1 : index - 1, TangentMode.AutoSmooth);
         }
 
         private void TruncateCollapsedKnotsFromEnd(Spline spline, float3 hitPos)
@@ -495,8 +588,6 @@ namespace Unity.Splines
                 if (tEnd <= tStart + 1e-4f)
                     continue;
 
-                m_EndCapOverrides.TryGetValue(s, out EndCapOverride caps);
-
                 int vertexOffset = m_Vertices.Count;
                 float splineLength = spline.GetLength();
                 float sampledLength = math.max(0f, (tEnd - tStart) * splineLength);
@@ -509,19 +600,6 @@ namespace Unity.Splines
 
                     Vector3 left = worldToLocal.MultiplyPoint3x4(leftEdge);
                     Vector3 right = worldToLocal.MultiplyPoint3x4(rightEdge);
-
-                    // Replace the joining cross-section with a miter so the strip
-                    // stays constant-width instead of pinching into the knot.
-                    if (i == 0 && caps.hasStart)
-                    {
-                        left = caps.startLeft;
-                        right = caps.startRight;
-                    }
-                    else if (i == resolution && caps.hasEnd)
-                    {
-                        left = caps.endLeft;
-                        right = caps.endRight;
-                    }
 
                     m_Vertices.Add(left);
                     m_Vertices.Add(right);
@@ -547,9 +625,9 @@ namespace Unity.Splines
                 }
             }
 
-            foreach (var junctionGroup in m_JunctionGroups)
+            foreach (var pad in m_JunctionPads)
             {
-                BuildJunctionMesh(junctionGroup, m_Vertices, m_RoadTriangles, m_UVs, m_Colors);
+                BuildJunctionMesh(pad, m_Vertices, m_RoadTriangles, m_UVs, m_Colors);
             }
 
             if (m_Vertices.Count > 0)
@@ -574,7 +652,7 @@ namespace Unity.Splines
         private void BuildJunctionData()
         {
             m_SplineTrimRanges.Clear();
-            m_EndCapOverrides.Clear();
+            m_JunctionPads.Clear();
 
             if (splineContainer == null) return;
 
@@ -583,43 +661,35 @@ namespace Unity.Splines
 
             foreach (var group in m_JunctionGroups)
             {
-                if (!TryBuildJunctionArms(group, out List<JunctionArm> arms) || arms.Count < 2)
+                if (!TryBuildJunctionArms(group, out List<JunctionArm> arms))
                     continue;
 
-                MarkThroughArms(arms);
-
-                // End-to-end collinear join: keep both strips full-length and flush.
+                // End-to-end collinear join: both strips already share a perpendicular end.
                 if (arms.Count == 2 && AreNearlyOpposite(arms[0].outward, arms[1].outward))
                     continue;
 
-                for (int i = 0; i < arms.Count; i++)
+                bool capsValid = true;
+                for (int i = 0; i < arms.Count && capsValid; i++)
                 {
                     var arm = arms[i];
-                    ComputeArmMiters(arms, i, out float3 leftMiter, out float3 rightMiter);
-                    arm.leftMiter = leftMiter;
-                    arm.rightMiter = rightMiter;
+                    capsValid = ComputeArmCap(ref arm, GetArmClearance(arms, i));
                     arms[i] = arm;
-
-                    if (!m_SplineTrimRanges.TryGetValue(arm.splineIndex, out float2 range))
-                        continue;
-
-                    var spline = splineContainer.Splines[arm.splineIndex];
-                    if (spline == null || spline.Count < 2) continue;
-
-                    // Through-road stays full-length so the existing mesh does not break.
-                    // Incoming / corner arms inset so the last cross-section can miter cleanly.
-                    if (!arm.isThrough)
-                    {
-                        float insetT = GetInsetT(spline);
-                        if (arm.t <= 0.5f)
-                            range.x = math.max(range.x, insetT);
-                        else
-                            range.y = math.min(range.y, 1f - insetT);
-                        m_SplineTrimRanges[arm.splineIndex] = range;
-                    }
-
-                    ApplyEndCapOverride(arm);
                 }
+                if (!capsValid) continue;
+
+                // Every arm stops at its cap. The cap is the strip's last cross-section, so the
+                // pad boundary shares those exact vertices and no gap or overlap can form.
+                foreach (var arm in arms)
+                {
+                    float2 range = m_SplineTrimRanges[arm.splineIndex];
+                    if (arm.t <= 0.5f)
+                        range.x = math.max(range.x, arm.capT);
+                    else
+                        range.y = math.min(range.y, arm.capT);
+                    m_SplineTrimRanges[arm.splineIndex] = range;
+                }
+
+                m_JunctionPads.Add(BuildJunctionPad(arms));
             }
         }
 
@@ -635,128 +705,130 @@ namespace Unity.Splines
 
                 if (!splineSampler.TryGetSplineWidthEdges(
                         junction.splineIndex, junction.t, m_Width,
-                        out float3 pos, out float3 tan, out float3 left, out float3 right))
+                        out float3 pos, out float3 tan, out _, out _))
                     continue;
 
-                if (math.lengthsq(tan) < 1e-8f) continue;
-
+                float3 outward = junction.t <= 0.5f ? tan : -tan;
                 arms.Add(new JunctionArm
                 {
                     splineIndex = junction.splineIndex,
                     t = junction.t,
                     pos = pos,
-                    outward = junction.t <= 0.5f ? tan : -tan,
-                    leftPt = left,
-                    rightPt = right,
-                    leftMiter = left,
-                    rightMiter = right
+                    outward = outward,
+                    angle = math.atan2(outward.z, outward.x)
                 });
             }
 
             if (arms.Count < 2) return false;
 
-            arms.Sort((a, b) =>
-            {
-                float angleA = math.atan2(a.outward.z, a.outward.x);
-                float angleB = math.atan2(b.outward.z, b.outward.x);
-                return angleA.CompareTo(angleB);
-            });
-
+            arms.Sort((a, b) => a.angle.CompareTo(b.angle));
             return true;
         }
 
-        private static void MarkThroughArms(List<JunctionArm> arms)
+        /// <summary>
+        /// Distance from the junction where this arm's edges clear both neighbours,
+        /// plus room for the curved blend.
+        /// </summary>
+        private float GetArmClearance(List<JunctionArm> arms, int index)
         {
-            if (arms.Count < 3) return;
+            int count = arms.Count;
+            float prevGap = WrapAngle(arms[index].angle - arms[(index - 1 + count) % count].angle);
+            float nextGap = WrapAngle(arms[(index + 1) % count].angle - arms[index].angle);
+            return math.max(ClearanceForGap(prevGap), ClearanceForGap(nextGap)) + m_Width * m_JunctionInsetScale;
+        }
 
-            float bestDot = 1f;
-            int ia = -1;
-            int ib = -1;
+        // Two straight roads of half-width w separated by `gap` stop overlapping at w / tan(gap / 2).
+        private float ClearanceForGap(float gap)
+        {
+            if (gap >= math.PI) return 0f;
+            return m_Width / math.tan(math.max(gap, 0.05f) * 0.5f);
+        }
+
+        private static float WrapAngle(float angle)
+        {
+            angle %= 2f * math.PI;
+            return angle < 0f ? angle + 2f * math.PI : angle;
+        }
+
+        private bool ComputeArmCap(ref JunctionArm arm, float clearance)
+        {
+            var spline = splineContainer.Splines[arm.splineIndex];
+            float length = math.max(spline.GetLength(), 1e-4f);
+            float inset = math.clamp(clearance / length, 0.01f, 0.45f);
+            bool alongSpline = arm.t <= 0.5f;
+            arm.capT = alongSpline ? inset : 1f - inset;
+
+            if (!splineSampler.TryGetSplineWidthEdges(
+                    arm.splineIndex, arm.capT, m_Width,
+                    out _, out float3 tan, out float3 left, out float3 right))
+                return false;
+
+            // Sampler edges follow spline direction; flip them for arms that leave against it
+            // so neighbouring arms always pair facing edges.
+            arm.capOutward = alongSpline ? tan : -tan;
+            arm.capLeft = alongSpline ? left : right;
+            arm.capRight = alongSpline ? right : left;
+            return true;
+        }
+
+        /// <summary>
+        /// Pad outline: each arm's cap, joined to the next arm by a quadratic Lerp curve whose
+        /// control point is where the two road edges meet, so the curb leaves each road tangent to it.
+        /// </summary>
+        private JunctionPad BuildJunctionPad(List<JunctionArm> arms)
+        {
+            Matrix4x4 worldToLocal = transform.worldToLocalMatrix;
+
+            float3 center = float3.zero;
+            foreach (var arm in arms)
+                center += arm.pos;
+            center /= arms.Count;
+
+            float curveLimit = 0f;
+            foreach (var arm in arms)
+                curveLimit = math.max(curveLimit, math.distance(arm.capLeft, center));
+            curveLimit += m_Width * 2f;
+
+            int segments = math.max(1, m_JunctionCurveSegments);
+            var boundary = new List<Vector3>(arms.Count * (segments + 1));
+
             for (int i = 0; i < arms.Count; i++)
             {
-                for (int j = i + 1; j < arms.Count; j++)
+                var arm = arms[i];
+                var next = arms[(i + 1) % arms.Count];
+
+                boundary.Add(worldToLocal.MultiplyPoint3x4(arm.capRight));
+                boundary.Add(worldToLocal.MultiplyPoint3x4(arm.capLeft));
+
+                Vector3 p0 = arm.capLeft;
+                Vector3 p2 = next.capRight;
+                Vector3 control = Vector3.Lerp(p0, p2, 0.5f);
+
+                // The edges must meet behind both caps (on the junction side). On the far side of a
+                // slightly curved through road the near-parallel edges can meet just past a cap, which
+                // would bend the curb back over that road strip; keep those edges straight.
+                if (TryIntersectLinesXZ(arm.capLeft, arm.capOutward, next.capRight, next.capOutward, out float3 hit)
+                    && math.distance(hit, center) <= curveLimit
+                    && math.dot(hit - arm.capLeft, arm.capOutward) <= 0f
+                    && math.dot(hit - next.capRight, next.capOutward) <= 0f)
                 {
-                    float d = math.dot(arms[i].outward, arms[j].outward);
-                    if (d < bestDot)
-                    {
-                        bestDot = d;
-                        ia = i;
-                        ib = j;
-                    }
+                    control = hit;
+                }
+
+                for (int k = 1; k < segments; k++)
+                {
+                    float s = k / (float)segments;
+                    Vector3 a = Vector3.Lerp(p0, control, s);
+                    Vector3 b = Vector3.Lerp(control, p2, s);
+                    boundary.Add(worldToLocal.MultiplyPoint3x4(Vector3.Lerp(a, b, s)));
                 }
             }
 
-            // Opposite pair = the original road that was split. Keep it undeformed.
-            if (bestDot > -0.45f || ia < 0) return;
-
-            var a = arms[ia];
-            a.isThrough = true;
-            arms[ia] = a;
-
-            var b = arms[ib];
-            b.isThrough = true;
-            arms[ib] = b;
-        }
-
-        private void ComputeArmMiters(List<JunctionArm> arms, int index, out float3 leftMiter, out float3 rightMiter)
-        {
-            JunctionArm arm = arms[index];
-            leftMiter = arm.leftPt;
-            rightMiter = arm.rightPt;
-
-            // A through-road keeps a perpendicular cap so the original strip does not shear.
-            if (arm.isThrough)
-                return;
-
-            int next = (index + 1) % arms.Count;
-            int prev = (index - 1 + arms.Count) % arms.Count;
-            float miterLimit = math.max(m_Width * 3f, 0.25f);
-
-            if (TryIntersectLinesXZ(arm.leftPt, arm.outward, arms[next].rightPt, arms[next].outward, out float3 leftHit)
-                && math.distance(leftHit, arm.pos) <= miterLimit)
+            return new JunctionPad
             {
-                leftMiter = leftHit;
-            }
-
-            if (TryIntersectLinesXZ(arm.rightPt, arm.outward, arms[prev].leftPt, arms[prev].outward, out float3 rightHit)
-                && math.distance(rightHit, arm.pos) <= miterLimit)
-            {
-                rightMiter = rightHit;
-            }
-        }
-
-        private void ApplyEndCapOverride(JunctionArm arm)
-        {
-            if (arm.isThrough) return;
-
-            Matrix4x4 worldToLocal = transform.worldToLocalMatrix;
-            if (!m_EndCapOverrides.TryGetValue(arm.splineIndex, out EndCapOverride caps))
-                caps = new EndCapOverride();
-
-            Vector3 left = worldToLocal.MultiplyPoint3x4(arm.leftMiter);
-            Vector3 right = worldToLocal.MultiplyPoint3x4(arm.rightMiter);
-
-            if (arm.t <= 0.5f)
-            {
-                caps.hasStart = true;
-                caps.startLeft = left;
-                caps.startRight = right;
-            }
-            else
-            {
-                caps.hasEnd = true;
-                caps.endLeft = left;
-                caps.endRight = right;
-            }
-
-            m_EndCapOverrides[arm.splineIndex] = caps;
-        }
-
-        private float GetInsetT(Spline spline)
-        {
-            float length = math.max(spline.GetLength(), 1e-4f);
-            float insetDistance = m_Width * m_JunctionInsetScale;
-            return math.clamp(insetDistance / length, 0.01f, 0.45f);
+                center = worldToLocal.MultiplyPoint3x4(center),
+                boundary = boundary
+            };
         }
 
         private static bool TryIntersectLinesXZ(float3 p1, float3 d1, float3 p2, float3 d2, out float3 result)
@@ -780,84 +852,35 @@ namespace Unity.Splines
         }
 
         private void BuildJunctionMesh(
-            List<JunctionBuilder.JunctionInfo> junctions,
+            JunctionPad pad,
             List<Vector3> vertices,
             List<int> triangles,
             List<Vector2> uvs,
             List<Color> colors)
         {
-            if (!TryBuildJunctionArms(junctions, out List<JunctionArm> arms) || arms.Count < 2)
-                return;
-
-            MarkThroughArms(arms);
-
-            // Two collinear roads already meet flush — no extra pad.
-            if (arms.Count == 2 && AreNearlyOpposite(arms[0].outward, arms[1].outward))
-                return;
-
-            Matrix4x4 worldToLocal = transform.worldToLocalMatrix;
-            var corners = new List<Vector3>(arms.Count * 2);
-
-            for (int i = 0; i < arms.Count; i++)
-            {
-                ComputeArmMiters(arms, i, out float3 leftMiter, out float3 rightMiter);
-                Vector3 left = worldToLocal.MultiplyPoint3x4(leftMiter);
-                Vector3 right = worldToLocal.MultiplyPoint3x4(rightMiter);
-
-                if (!ContainsClosePoint(corners, left))
-                    corners.Add(left);
-                if (!ContainsClosePoint(corners, right))
-                    corners.Add(right);
-            }
-
-            if (corners.Count < 3) return;
-
-            Vector3 center = Vector3.zero;
-            for (int i = 0; i < corners.Count; i++)
-                center += corners[i];
-            center /= corners.Count;
-
-            corners.Sort((a, b) =>
-            {
-                float angleA = Mathf.Atan2(a.z - center.z, a.x - center.x);
-                float angleB = Mathf.Atan2(b.z - center.z, b.x - center.x);
-                return angleA.CompareTo(angleB);
-            });
+            int count = pad.boundary.Count;
+            if (count < 3) return;
 
             int centerIndex = vertices.Count;
-            vertices.Add(center);
-            uvs.Add(new Vector2(center.x * m_TextureScale, center.z * m_TextureScale));
+            vertices.Add(pad.center);
+            uvs.Add(new Vector2(pad.center.x * m_TextureScale, pad.center.z * m_TextureScale));
             colors.Add(Color.white);
 
             int first = vertices.Count;
-            for (int i = 0; i < corners.Count; i++)
+            foreach (var c in pad.boundary)
             {
-                Vector3 c = corners[i];
                 vertices.Add(c);
                 uvs.Add(new Vector2(c.x * m_TextureScale, c.z * m_TextureScale));
                 colors.Add(Color.white);
             }
 
-            for (int i = 0; i < corners.Count; i++)
+            // Boundary runs counter-clockwise by angle, same winding as before.
+            for (int i = 0; i < count; i++)
             {
-                int current = first + i;
-                int next = first + (i + 1) % corners.Count;
-
                 triangles.Add(centerIndex);
-                triangles.Add(next);
-                triangles.Add(current);
+                triangles.Add(first + (i + 1) % count);
+                triangles.Add(first + i);
             }
-        }
-
-        private static bool ContainsClosePoint(List<Vector3> points, Vector3 candidate)
-        {
-            const float sqr = 0.0001f;
-            for (int i = 0; i < points.Count; i++)
-            {
-                if ((points[i] - candidate).sqrMagnitude <= sqr)
-                    return true;
-            }
-            return false;
         }
 
         public void RemoveJunction(JunctionBuilder.JunctionInfo junction)
@@ -925,7 +948,10 @@ namespace Unity.Splines
                     parent[rb] = ra;
             }
 
-            float snapSq = m_JunctionSnapDistance * m_JunctionSnapDistance;
+            // Connected ends are snapped onto the same point, so only touching ends form a junction.
+            // The larger snap radius chained neighbouring junctions into one distorted pad.
+            float joinDistance = math.min(m_JunctionSnapDistance, m_Width * 0.5f);
+            float snapSq = joinDistance * joinDistance;
             for (int i = 0; i < n; i++)
             {
                 float3 pi = candidates[i].knot.Position;

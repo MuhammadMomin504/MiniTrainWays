@@ -65,7 +65,8 @@ namespace Unity.Splines
                 localPos.y = -2f;
 
                 if (m_SplineTrack != null &&
-                    m_SplineTrack.TrySnapToNearestEndpoint(localPos, -1, out float3 snappedStart))
+                    m_SplineTrack.TrySnapToNearestEndpoint(localPos, -1, out float3 snappedStart,
+                        m_SplineTrack.JunctionMergeDistance))
                 {
                     localPos = snappedStart;
                     localPos.y = -2f;
