@@ -1,3 +1,5 @@
+Project facts (versions, scene wiring, scripts, conventions): @docs/PROJECT_CONTEXT.md
+
 # Core Agent Behavior
 
 - Work with the project as it exists. Do not impose generic architecture or conventions without verifying their fit.
