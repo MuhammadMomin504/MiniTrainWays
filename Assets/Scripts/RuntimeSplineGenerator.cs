@@ -14,6 +14,8 @@ namespace Unity.Splines
         [SerializeField] private LayerMask m_GroundLayer = -1;
         [SerializeField] private bool m_AutoConnectOnCollision = true;
         [SerializeField] private float m_MinLengthBeforeAutoConnect = 1.0f;
+        [Tooltip("Half-width given to newly drawn roads. Zero or less uses the SplineTrack default.")]
+        [SerializeField] private float m_RoadWidth = 0f;
 
         private Spline m_CurrentSpline;
         private int m_CurrentSplineIndex = -1;
@@ -119,6 +121,9 @@ namespace Unity.Splines
         {
             m_CurrentSpline = m_SplineContainer.AddSpline();
             m_CurrentSplineIndex = m_SplineContainer.Splines.Count - 1;
+
+            if (m_SplineTrack != null && m_RoadWidth > 0f)
+                m_SplineTrack.SetRoadWidth(m_CurrentSpline, m_RoadWidth);
 
             m_CurrentSpline.Add(new BezierKnot(position), TangentMode.AutoSmooth);
         }

@@ -12,8 +12,10 @@ namespace Unity.Splines
         [SerializeField] private SplineSampler splineSampler = default;
         [SerializeField] private SplineContainer splineContainer;
         [SerializeField] private int splineIndex = 0;
+        [Tooltip("Default road half-width. Each spline can override it (see SetRoadWidth).")]
         [SerializeField] private float m_Width = 0.5f;
         [SerializeField] private int resolution = 20;
+        [Tooltip("Along-road UV per road width. 1 keeps lane markings in proportion to the road width.")]
         [SerializeField] private float m_TextureScale = 1.0f;
         [SerializeField] private Material m_JunctionMaterial;
         [SerializeField] private float m_JunctionSnapDistance = 0.5f;
@@ -24,7 +26,10 @@ namespace Unity.Splines
         [Tooltip("Max centerline distance to treat a drawn tip as colliding with an existing road.")]
         [SerializeField] private float m_ConnectDistance = -1f;
 
+        private const string k_RoadWidthKey = "roadWidth";
+
         private List<List<JunctionBuilder.JunctionInfo>> m_JunctionGroups = new List<List<JunctionBuilder.JunctionInfo>>();
+        private bool m_NetworkDirty;
 
         private MeshFilter m_MeshFilter;
         private Mesh m_Mesh;
@@ -32,7 +37,7 @@ namespace Unity.Splines
         private List<Vector3> m_Vertices = new List<Vector3>();
         private List<int> m_RoadTriangles = new List<int>();
         private List<int> m_JunctionTriangles = new List<int>();
-        private List<Vector2> m_UVs = new List<Vector2>();
+        private List<Vector3> m_UVs = new List<Vector3>();   // (u·q, v·q, q): projective, see AddStripUVs
         private List<Color> m_Colors = new List<Color>();
 
         private readonly Dictionary<int, float2> m_SplineTrimRanges = new Dictionary<int, float2>();
@@ -45,6 +50,7 @@ namespace Unity.Splines
             public float3 pos;         // centerline point at the junction
             public float3 outward;     // direction leaving the junction
             public float angle;
+            public float width;        // this road's half-width
             public float capT;         // where the road strip stops and the pad takes over
             public float3 capOutward;
             public float3 capLeft;     // left/right relative to outward, not spline direction
@@ -55,6 +61,10 @@ namespace Unity.Splines
         {
             public Vector3 center;
             public List<Vector3> boundary;
+            public float uvScale;      // UV per unit, matching the connected roads' texel density
+            public float width;        // average half-width of the connected roads
+            public List<Vector3> bendLeft;   // two-road bends: edges of a marked strip from cap to cap
+            public List<Vector3> bendRight;
         }
 
         public float JunctionSnapDistance => m_JunctionSnapDistance;
@@ -68,6 +78,66 @@ namespace Unity.Splines
         /// forming its own; farther away it gets a separate junction so the new road is not bent.
         /// </summary>
         public float JunctionMergeDistance => math.min(m_JunctionSnapDistance, m_Width * 2f);
+
+        /// <summary>
+        /// Half-width of one road. Stored on the spline itself so it survives saving and editing;
+        /// splines without their own value use the track default.
+        /// </summary>
+        public float GetRoadWidth(Spline spline)
+        {
+            if (spline != null && spline.TryGetFloatData(k_RoadWidthKey, out SplineData<float> data) && data.DefaultValue > 0f)
+                return data.DefaultValue;
+            return m_Width;
+        }
+
+        public float GetRoadWidth(int splineIndex) => GetRoadWidth(splineContainer.Splines[splineIndex]);
+
+        /// <summary>Gives one road its own half-width; zero or less returns it to the track default.</summary>
+        public void SetRoadWidth(Spline spline, float width)
+        {
+            if (spline == null) return;
+            if (width > 0f)
+                spline.GetOrCreateFloatData(k_RoadWidthKey).DefaultValue = width;
+            else
+                spline.RemoveFloatData(k_RoadWidthKey);
+            m_NetworkDirty = true;
+        }
+
+        private void OnEnable()
+        {
+            Spline.Changed += OnSplineChanged;
+            SplineContainer.SplineAdded += OnContainerChanged;
+            SplineContainer.SplineRemoved += OnContainerChanged;
+            // Junctions are derived from the splines; rebuild them after loading or a script reload.
+            m_NetworkDirty = true;
+        }
+
+        private void OnDisable()
+        {
+            Spline.Changed -= OnSplineChanged;
+            SplineContainer.SplineAdded -= OnContainerChanged;
+            SplineContainer.SplineRemoved -= OnContainerChanged;
+        }
+
+        private void OnSplineChanged(Spline spline, int knotIndex, SplineModification modification)
+        {
+            if (IndexOfSpline(spline) >= 0)
+                m_NetworkDirty = true;
+        }
+
+        private void OnContainerChanged(SplineContainer container, int index)
+        {
+            if (container == splineContainer)
+                m_NetworkDirty = true;
+        }
+
+        // Moving, editing, connecting or disconnecting a road re-detects junctions once per frame.
+        private void LateUpdate()
+        {
+            if (!m_NetworkDirty) return;
+            m_NetworkDirty = false;
+            AutoDetectJunctions();
+        }
 
         private void Awake()
         {
@@ -237,6 +307,9 @@ namespace Unity.Splines
             // After split: first half ends at junction; second half starts at junction.
             // Leave those knots alone so the through-road does not warp.
             var firstHalf = splineContainer.Splines[hitSplineIndex];
+            // Splitting does not carry per-spline data over; keep both halves the same width.
+            if (firstHalf.TryGetFloatData(k_RoadWidthKey, out SplineData<float> widthData))
+                SetRoadWidth(splineContainer.Splines[splitStart.Spline], widthData.DefaultValue);
             connectingIndex = IndexOfSpline(connecting);
             if (connectingIndex < 0)
                 return false;
@@ -548,7 +621,7 @@ namespace Unity.Splines
 
         public void RebuildMesh()
         {
-            if (splineContainer == null || splineContainer.Splines == null) return;
+            if (splineContainer == null || splineContainer.Splines == null || splineSampler == null) return;
 
             if (m_MeshFilter == null)
                 m_MeshFilter = GetComponent<MeshFilter>();
@@ -589,25 +662,52 @@ namespace Unity.Splines
                     continue;
 
                 int vertexOffset = m_Vertices.Count;
-                float splineLength = spline.GetLength();
-                float sampledLength = math.max(0f, (tEnd - tStart) * splineLength);
+                float width = GetRoadWidth(spline);
+
+                // U runs across the road, V along it in road widths. V is measured on the real
+                // centerline, so markings never stretch where t is uneven and scale with the width.
+                float vScale = m_TextureScale / math.max(2f * width, 1e-4f);
+                float distance = 0f;
+                Vector3 previousCenter = Vector3.zero;
+                Vector3 previousLeft = Vector3.zero;
+                Vector3 previousRight = Vector3.zero;
 
                 for (int i = 0; i <= resolution; i++)
                 {
-                    float t = math.lerp(tStart, tEnd, i / (float)resolution);
+                    // The last section uses tEnd exactly so it matches the junction cap bit for bit.
+                    float t = i == resolution ? tEnd : math.lerp(tStart, tEnd, i / (float)resolution);
 
-                    splineSampler.GetSplineWidthEdges(s, t, m_Width, out float3 leftEdge, out float3 rightEdge);
+                    splineSampler.TryGetSplineWidthEdges(s, t, width,
+                        out float3 centerEdge, out _, out float3 leftEdge, out float3 rightEdge);
 
                     Vector3 left = worldToLocal.MultiplyPoint3x4(leftEdge);
                     Vector3 right = worldToLocal.MultiplyPoint3x4(rightEdge);
 
+                    // Around a bend tighter than the road is wide, the inner edge runs backwards and
+                    // would fold the strip over itself (flipped triangles, overlapping surface). Hold
+                    // an edge in place whenever its new triangle would face the wrong way, so the inner
+                    // edge pivots instead of folding. End sections are left alone so junction caps match.
+                    if (i > 0 && i < resolution)
+                    {
+                        if (FacingUp(previousLeft, left, previousRight) <= 0f)
+                            left = previousLeft;
+                        if (FacingUp(previousRight, left, right) <= 0f)
+                            right = previousRight;
+                    }
+                    previousLeft = left;
+                    previousRight = right;
+
+                    Vector3 center = worldToLocal.MultiplyPoint3x4(centerEdge);
+                    if (i > 0)
+                        distance += Vector3.Distance(center, previousCenter);
+                    previousCenter = center;
+
                     m_Vertices.Add(left);
                     m_Vertices.Add(right);
 
-                    float v = ((t - tStart) / math.max(tEnd - tStart, 1e-4f)) * sampledLength * m_TextureScale;
-                    m_UVs.Add(new Vector2(0, v));
-                    m_UVs.Add(new Vector2(1, v));
+                    AddStripUVs(m_UVs, distance * vScale, Vector3.Distance(left, right) / (2f * width));
 
+                    // Alpha 1 lets the road shader paint lane markings on strips.
                     m_Colors.Add(Color.white);
                     m_Colors.Add(Color.white);
 
@@ -633,6 +733,9 @@ namespace Unity.Splines
             if (m_Vertices.Count > 0)
             {
                 m_Mesh.Clear();
+                m_Mesh.indexFormat = m_Vertices.Count > 65535
+                    ? UnityEngine.Rendering.IndexFormat.UInt32
+                    : UnityEngine.Rendering.IndexFormat.UInt16;
                 m_Mesh.SetVertices(m_Vertices);
 
                 m_Mesh.subMeshCount = 1;
@@ -640,13 +743,39 @@ namespace Unity.Splines
 
                 m_Mesh.SetUVs(0, m_UVs);
                 m_Mesh.SetColors(m_Colors);
-                m_Mesh.RecalculateNormals();
+
+                // Roads and junctions are one flat surface built in a world-up frame, so every
+                // vertex shares the same normal: no shading seams where strips meet pads.
+                Vector3 up = transform.InverseTransformDirection(Vector3.up).normalized;
+                var normals = new Vector3[m_Vertices.Count];
+                for (int i = 0; i < normals.Length; i++)
+                    normals[i] = up;
+                m_Mesh.normals = normals;
                 m_Mesh.RecalculateBounds();
             }
             else
             {
                 m_Mesh.Clear();
             }
+        }
+
+        /// <summary>
+        /// Strip UVs for one cross-section, stored projectively as (u·q, v·q, q) with q the section's
+        /// width relative to the road (1 on a normal strip). Where a strip tapers (width changes or a
+        /// held inner edge), plain UVs would zig-zag the markings along each quad's diagonal; dividing
+        /// by q in the shader keeps lines of constant u straight.
+        /// </summary>
+        private static void AddStripUVs(List<Vector3> uvs, float v, float q)
+        {
+            q = math.max(q, 1e-3f);
+            uvs.Add(new Vector3(0f, v * q, q));
+            uvs.Add(new Vector3(q, v * q, q));
+        }
+
+        // Up component of a triangle's normal with this mesh's winding; positive means it faces up.
+        private static float FacingUp(Vector3 a, Vector3 b, Vector3 c)
+        {
+            return Vector3.Cross(b - a, c - a).y;
         }
 
         private void BuildJunctionData()
@@ -664,8 +793,11 @@ namespace Unity.Splines
                 if (!TryBuildJunctionArms(group, out List<JunctionArm> arms))
                     continue;
 
-                // End-to-end collinear join: both strips already share a perpendicular end.
-                if (arms.Count == 2 && AreNearlyOpposite(arms[0].outward, arms[1].outward))
+                // A straight continuation of the same width already meets flush; a pad there would only
+                // interrupt the lane markings. Any bend or width change gets a proper pad, otherwise the
+                // two perpendicular ends leave a wedge gap on the outside of the bend.
+                if (arms.Count == 2 && AreNearlyOpposite(arms[0].outward, arms[1].outward) &&
+                    math.abs(arms[0].width - arms[1].width) < 1e-4f)
                     continue;
 
                 bool capsValid = true;
@@ -703,8 +835,9 @@ namespace Unity.Splines
                 if (junction.splineIndex < 0 || junction.splineIndex >= splineContainer.Splines.Count)
                     continue;
 
+                float width = GetRoadWidth(junction.splineIndex);
                 if (!splineSampler.TryGetSplineWidthEdges(
-                        junction.splineIndex, junction.t, m_Width,
+                        junction.splineIndex, junction.t, width,
                         out float3 pos, out float3 tan, out _, out _))
                     continue;
 
@@ -715,7 +848,8 @@ namespace Unity.Splines
                     t = junction.t,
                     pos = pos,
                     outward = outward,
-                    angle = math.atan2(outward.z, outward.x)
+                    angle = math.atan2(outward.z, outward.x),
+                    width = width
                 });
             }
 
@@ -732,16 +866,31 @@ namespace Unity.Splines
         private float GetArmClearance(List<JunctionArm> arms, int index)
         {
             int count = arms.Count;
-            float prevGap = WrapAngle(arms[index].angle - arms[(index - 1 + count) % count].angle);
-            float nextGap = WrapAngle(arms[(index + 1) % count].angle - arms[index].angle);
-            return math.max(ClearanceForGap(prevGap), ClearanceForGap(nextGap)) + m_Width * m_JunctionInsetScale;
+            var arm = arms[index];
+            var prev = arms[(index - 1 + count) % count];
+            var next = arms[(index + 1) % count];
+            float prevGap = WrapAngle(arm.angle - prev.angle);
+            float nextGap = WrapAngle(next.angle - arm.angle);
+            return math.max(
+                       ClearanceForGap(arm.width, prev.width, prevGap),
+                       ClearanceForGap(arm.width, next.width, nextGap))
+                   + arm.width * m_JunctionInsetScale;
         }
 
-        // Two straight roads of half-width w separated by `gap` stop overlapping at w / tan(gap / 2).
-        private float ClearanceForGap(float gap)
+        /// <summary>
+        /// Distance along a road of half-width w at which its edge crosses the facing edge of a
+        /// neighbour of half-width wOther leaving the junction `gap` radians away:
+        /// (wOther + w cos gap) / sin gap, which is w / tan(gap / 2) for equal widths.
+        /// </summary>
+        private static float ClearanceForGap(float w, float wOther, float gap)
         {
             if (gap >= math.PI) return 0f;
-            return m_Width / math.tan(math.max(gap, 0.05f) * 0.5f);
+            float clearance = (wOther + w * math.cos(gap)) / math.max(math.sin(gap), math.sin(0.05f));
+            // Near-opposite roads of different widths have almost parallel edges that only meet far
+            // away; they cannot overlap there, so a short taper is enough.
+            if (gap > math.PI * 0.5f)
+                clearance = math.min(clearance, math.max(w, wOther));
+            return math.max(0f, clearance);
         }
 
         private static float WrapAngle(float angle)
@@ -759,7 +908,7 @@ namespace Unity.Splines
             arm.capT = alongSpline ? inset : 1f - inset;
 
             if (!splineSampler.TryGetSplineWidthEdges(
-                    arm.splineIndex, arm.capT, m_Width,
+                    arm.splineIndex, arm.capT, arm.width,
                     out _, out float3 tan, out float3 left, out float3 right))
                 return false;
 
@@ -785,12 +934,23 @@ namespace Unity.Splines
             center /= arms.Count;
 
             float curveLimit = 0f;
+            float maxWidth = 0f;
+            float widthSum = 0f;
             foreach (var arm in arms)
+            {
                 curveLimit = math.max(curveLimit, math.distance(arm.capLeft, center));
-            curveLimit += m_Width * 2f;
+                maxWidth = math.max(maxWidth, arm.width);
+                widthSum += arm.width;
+            }
+            curveLimit += maxWidth * 2f;
 
             int segments = math.max(1, m_JunctionCurveSegments);
             var boundary = new List<Vector3>(arms.Count * (segments + 1));
+
+            // Curb between each arm's left edge and the next arm's right edge.
+            var controls = new Vector3[arms.Count];
+            for (int i = 0; i < arms.Count; i++)
+                controls[i] = CurbControl(arms[i], arms[(i + 1) % arms.Count], center, curveLimit);
 
             for (int i = 0; i < arms.Count; i++)
             {
@@ -800,35 +960,64 @@ namespace Unity.Splines
                 boundary.Add(worldToLocal.MultiplyPoint3x4(arm.capRight));
                 boundary.Add(worldToLocal.MultiplyPoint3x4(arm.capLeft));
 
-                Vector3 p0 = arm.capLeft;
-                Vector3 p2 = next.capRight;
-                Vector3 control = Vector3.Lerp(p0, p2, 0.5f);
-
-                // The edges must meet behind both caps (on the junction side). On the far side of a
-                // slightly curved through road the near-parallel edges can meet just past a cap, which
-                // would bend the curb back over that road strip; keep those edges straight.
-                if (TryIntersectLinesXZ(arm.capLeft, arm.capOutward, next.capRight, next.capOutward, out float3 hit)
-                    && math.distance(hit, center) <= curveLimit
-                    && math.dot(hit - arm.capLeft, arm.capOutward) <= 0f
-                    && math.dot(hit - next.capRight, next.capOutward) <= 0f)
-                {
-                    control = hit;
-                }
-
                 for (int k = 1; k < segments; k++)
                 {
                     float s = k / (float)segments;
-                    Vector3 a = Vector3.Lerp(p0, control, s);
-                    Vector3 b = Vector3.Lerp(control, p2, s);
-                    boundary.Add(worldToLocal.MultiplyPoint3x4(Vector3.Lerp(a, b, s)));
+                    boundary.Add(worldToLocal.MultiplyPoint3x4(QuadraticLerp(arm.capLeft, controls[i], next.capRight, s)));
                 }
             }
 
-            return new JunctionPad
+            var pad = new JunctionPad
             {
                 center = worldToLocal.MultiplyPoint3x4(center),
-                boundary = boundary
+                boundary = boundary,
+                uvScale = m_TextureScale / math.max(2f * widthSum / arms.Count, 1e-4f),
+                width = widthSum / arms.Count
             };
+
+            // A bend or width change between just two roads is not an intersection: loft it as a road
+            // strip from cap to cap, each cross-section lerped between the two curbs, so the lane
+            // markings follow the curve instead of stopping at a plain pad.
+            if (arms.Count == 2)
+            {
+                int sections = segments * 2;
+                pad.bendLeft = new List<Vector3>(sections + 1);
+                pad.bendRight = new List<Vector3>(sections + 1);
+                for (int k = 0; k <= sections; k++)
+                {
+                    float s = k / (float)sections;
+                    pad.bendLeft.Add(worldToLocal.MultiplyPoint3x4(
+                        QuadraticLerp(arms[0].capRight, controls[1], arms[1].capLeft, s)));
+                    pad.bendRight.Add(worldToLocal.MultiplyPoint3x4(
+                        QuadraticLerp(arms[0].capLeft, controls[0], arms[1].capRight, s)));
+                }
+            }
+
+            return pad;
+        }
+
+        /// <summary>
+        /// Control point of the curb from one arm's left edge to the next arm's right edge: where the
+        /// two edge lines meet, so the curb leaves each road tangent to it.
+        /// </summary>
+        private static Vector3 CurbControl(JunctionArm arm, JunctionArm next, float3 center, float curveLimit)
+        {
+            // The edges must meet behind both caps (on the junction side). On the far side of a
+            // slightly curved through road the near-parallel edges can meet just past a cap, which
+            // would bend the curb back over that road strip; keep those edges straight.
+            if (TryIntersectLinesXZ(arm.capLeft, arm.capOutward, next.capRight, next.capOutward, out float3 hit)
+                && math.distance(hit, center) <= curveLimit
+                && math.dot(hit - arm.capLeft, arm.capOutward) <= 0f
+                && math.dot(hit - next.capRight, next.capOutward) <= 0f)
+            {
+                return hit;
+            }
+            return Vector3.Lerp(arm.capLeft, next.capRight, 0.5f);
+        }
+
+        private static Vector3 QuadraticLerp(Vector3 p0, Vector3 control, Vector3 p2, float s)
+        {
+            return Vector3.Lerp(Vector3.Lerp(p0, control, s), Vector3.Lerp(control, p2, s), s);
         }
 
         private static bool TryIntersectLinesXZ(float3 p1, float3 d1, float3 p2, float3 d2, out float3 result)
@@ -848,30 +1037,40 @@ namespace Unity.Splines
 
         private static bool AreNearlyOpposite(float3 a, float3 b)
         {
-            return math.dot(a, b) < -0.75f;
+            return math.dot(a, b) < -0.996f;
         }
 
         private void BuildJunctionMesh(
             JunctionPad pad,
             List<Vector3> vertices,
             List<int> triangles,
-            List<Vector2> uvs,
+            List<Vector3> uvs,
             List<Color> colors)
         {
+            if (pad.bendLeft != null)
+            {
+                BuildBendStrip(pad, vertices, triangles, uvs, colors);
+                return;
+            }
+
             int count = pad.boundary.Count;
             if (count < 3) return;
 
+            // Pads get their own planar UVs at the roads' texel density instead of stretched strip
+            // UVs, and alpha 0 tells the road shader to leave lane markings off the junction.
+            var padColor = new Color(1f, 1f, 1f, 0f);
+
             int centerIndex = vertices.Count;
             vertices.Add(pad.center);
-            uvs.Add(new Vector2(pad.center.x * m_TextureScale, pad.center.z * m_TextureScale));
-            colors.Add(Color.white);
+            uvs.Add(new Vector3(pad.center.x * pad.uvScale, pad.center.z * pad.uvScale, 1f));
+            colors.Add(padColor);
 
             int first = vertices.Count;
             foreach (var c in pad.boundary)
             {
                 vertices.Add(c);
-                uvs.Add(new Vector2(c.x * m_TextureScale, c.z * m_TextureScale));
-                colors.Add(Color.white);
+                uvs.Add(new Vector3(c.x * pad.uvScale, c.z * pad.uvScale, 1f));
+                colors.Add(padColor);
             }
 
             // Boundary runs counter-clockwise by angle, same winding as before.
@@ -880,6 +1079,60 @@ namespace Unity.Splines
                 triangles.Add(centerIndex);
                 triangles.Add(first + (i + 1) % count);
                 triangles.Add(first + i);
+            }
+        }
+
+        // Same layout as a road strip: U across, V along in road widths, markings on (alpha 1).
+        private static void BuildBendStrip(
+            JunctionPad pad,
+            List<Vector3> vertices,
+            List<int> triangles,
+            List<Vector3> uvs,
+            List<Color> colors)
+        {
+            int offset = vertices.Count;
+            int last = pad.bendLeft.Count - 1;
+            float distance = 0f;
+            Vector3 previousCenter = Vector3.zero;
+            Vector3 previousLeft = Vector3.zero;
+            Vector3 previousRight = Vector3.zero;
+
+            for (int k = 0; k <= last; k++)
+            {
+                Vector3 left = pad.bendLeft[k];
+                Vector3 right = pad.bendRight[k];
+                Vector3 center = (left + right) * 0.5f;
+                if (k > 0)
+                    distance += Vector3.Distance(center, previousCenter);
+                previousCenter = center;
+
+                if (k > 0 && k < last)
+                {
+                    if (FacingUp(previousLeft, left, previousRight) <= 0f)
+                        left = previousLeft;
+                    if (FacingUp(previousRight, left, right) <= 0f)
+                        right = previousRight;
+                }
+                previousLeft = left;
+                previousRight = right;
+
+                vertices.Add(left);
+                vertices.Add(right);
+                AddStripUVs(uvs, distance * pad.uvScale, Vector3.Distance(left, right) / (2f * pad.width));
+                colors.Add(Color.white);
+                colors.Add(Color.white);
+
+                if (k < last)
+                {
+                    int start = offset + k * 2;
+                    triangles.Add(start);
+                    triangles.Add(start + 2);
+                    triangles.Add(start + 1);
+
+                    triangles.Add(start + 1);
+                    triangles.Add(start + 2);
+                    triangles.Add(start + 3);
+                }
             }
         }
 
